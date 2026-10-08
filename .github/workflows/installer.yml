@@ -5,12 +5,17 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:   # a new push cancels an older run of the same branch
+  group: installer-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write   # create the GitHub Release the auto-updater reads
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -70,15 +75,22 @@ jobs:
 
       - name: Smoke test - silent install + launch with Windows PowerShell 5.1
         shell: pwsh
+        timeout-minutes: 15
         env: { MT5TV_NONINTERACTIVE: "1" }
         run: |
           $exe = (Get-ChildItem installer\Output\MT5TVTerminal-Setup-*.exe)[0].FullName
           $dir = Join-Path $env:RUNNER_TEMP 'mt5tv'
-          Start-Process $exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$dir`"", '/MODE=native', '/TASKS=desktopicon' -Wait
+          # Wait on the process object only: Start-Process -Wait would also wait for every child.
+          $setup = Start-Process $exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$dir`"", '/MODE=native', '/TASKS=desktopicon' -PassThru
+          if (-not $setup.WaitForExit(600000)) { throw 'installer did not finish within 10 min' }
           if (-not (Test-Path "$dir\runtime\python\pythonw.exe")) { throw 'bundled runtime missing after install' }
           if (-not (Test-Path "$dir\config.json")) { throw 'config.json missing' }
           Get-Content "$dir\config.json"
-          $launch = Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$dir\launcher\launch.ps1`"", '-NoUpdate' -Wait -PassThru
+          # The launcher leaves the bridge running in the background on purpose, so wait for the
+          # launcher process itself, not its process tree.
+          $launch = Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$dir\launcher\launch.ps1`"", '-NoUpdate' -PassThru
+          $null = $launch.Handle   # cache the handle so ExitCode is readable after exit
+          if (-not $launch.WaitForExit(300000)) { throw 'launcher did not exit within 5 min' }
           $log = Join-Path $env:LOCALAPPDATA 'MT5TVTerminal'
           Get-Content "$log\launcher.log" -ErrorAction SilentlyContinue
           if ($launch.ExitCode -ne 0) { Get-Content "$log\bridge.log" -ErrorAction SilentlyContinue; throw "launcher exited $($launch.ExitCode)" }
@@ -87,7 +99,8 @@ jobs:
           $ui = Invoke-WebRequest http://127.0.0.1:8765/ -UseBasicParsing
           if ($ui.Content -notmatch 'id="root"') { throw 'UI page not served' }
           Write-Host 'Smoke test passed: installer -> launcher -> bridge -> UI'
-          Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$dir\launcher\launch.ps1`"", '-Stop' -Wait
+          $stop = Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$dir\launcher\launch.ps1`"", '-Stop' -PassThru
+          $null = $stop.WaitForExit(120000)
 
       - uses: actions/upload-artifact@v4
         with:
