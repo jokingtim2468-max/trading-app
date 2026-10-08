@@ -1,0 +1,10 @@
+node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.env
+secrets/*
+!secrets/README.md
+backend/state/
+.pytest_cache/
+runtime/

@@ -1,0 +1,66 @@
+# One command: `docker compose up -d` -> MT5 (headless, Wine) + bridge/UI on http://127.0.0.1:8765
+# Nothing is shown on screen; the MT5 GUI renders into a virtual display inside its container.
+name: mt5-tv-terminal
+
+services:
+  mt5:
+    build: ./docker/mt5
+    image: mt5-tv-terminal/mt5:latest
+    restart: unless-stopped
+    networks: [mt5-private, mt5-egress]   # private link to the bridge + internet for the broker
+    volumes:
+      - mt5-prefix:/home/trader/.wine      # terminal, MQL5 folder, logs persist across restarts
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    shm_size: 512m
+    # No `ports:` on purpose - the RPyC port is reachable only from the bridge.
+
+  bridge:
+    build:
+      context: .
+      dockerfile: docker/bridge/Dockerfile
+    image: mt5-tv-terminal/bridge:latest
+    restart: unless-stopped
+    depends_on: [mt5]
+    networks: [mt5-private, bridge-egress]
+    ports:
+      - "127.0.0.1:8765:8765"              # localhost only
+    environment:
+      MT5_RPYC_HOST: mt5
+      MT5_RPYC_PORT: "18812"
+      MT5_DATA_DIR: "/mt5/drive_c/Program Files/MetaTrader 5"
+      MT5_LOGIN_FILE: /run/secrets/mt5_login
+      MT5_PASSWORD_FILE: /run/secrets/mt5_password
+      MT5_SERVER_FILE: /run/secrets/mt5_server
+      TV_SESSIONID_FILE: /run/secrets/tv_sessionid
+      AGENT_STATE_DIR: /state
+      MT5_PATH: 'C:\Program Files\MetaTrader 5\terminal64.exe'
+      MT5_PORTABLE: "1"                    # attach to the /portable terminal started in the mt5 container
+      HOME: /tmp                           # read-only rootfs: library caches (yfinance) go to tmpfs
+      XDG_CACHE_HOME: /tmp/.cache
+      ANTHROPIC_API_KEY_FILE: /run/secrets/anthropic_api_key
+    secrets: [mt5_login, mt5_password, mt5_server, tv_sessionid, anthropic_api_key]
+    volumes:
+      - mt5-prefix:/mt5:ro                 # read-only view of EAs/indicators for the explorer
+      - agent-state:/state                 # FTMO guardrail state (daily start equity, trading days)
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+
+networks:
+  mt5-private:
+    internal: true        # no internet, no host access - only mt5 <-> bridge
+  mt5-egress: {}
+  bridge-egress: {}
+
+volumes:
+  mt5-prefix: {}
+  agent-state: {}
+
+secrets:
+  mt5_login:          { file: ./secrets/mt5_login.txt }
+  mt5_password:       { file: ./secrets/mt5_password.txt }
+  mt5_server:         { file: ./secrets/mt5_server.txt }
+  tv_sessionid:       { file: ./secrets/tv_sessionid.txt }
+  anthropic_api_key:  { file: ./secrets/anthropic_api_key.txt }

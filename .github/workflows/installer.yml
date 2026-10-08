@@ -1,0 +1,108 @@
+name: Windows installer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create the GitHub Release the auto-updater reads
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Backend tests
+        working-directory: backend
+        env: { BRIDGE_SIM: "1" }
+        run: |
+          pip install fastapi "uvicorn[standard]" pandas requests defusedxml tzdata "anthropic>=1.0,<2" yfinance pytest httpx
+          pytest -q
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", cache: npm, cache-dependency-path: frontend/package-lock.json }
+      - name: Build UI
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run build
+
+      - name: Bundle Python runtime (no Python/Git needed on the user's PC)
+        shell: pwsh
+        run: |
+          $v = '3.11.9'
+          Invoke-WebRequest "https://www.python.org/ftp/python/$v/python-$v-embed-amd64.zip" -OutFile py.zip
+          Expand-Archive py.zip runtime/python -Force
+          Remove-Item py.zip
+          $pth = (Get-ChildItem runtime/python/python3*._pth).FullName
+          # enable site-packages and put the backend on sys.path (paths are relative to python.exe)
+          (Get-Content $pth) -replace '^#import site', 'import site' | Set-Content $pth
+          Add-Content $pth '..\..\backend'
+          Invoke-WebRequest https://bootstrap.pypa.io/get-pip.py -OutFile runtime/python/get-pip.py
+          runtime/python/python.exe runtime/python/get-pip.py --no-warn-script-location
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          runtime/python/python.exe -m pip install --no-warn-script-location --disable-pip-version-check -r backend/requirements.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Remove-Item runtime/python/get-pip.py
+          runtime/python/python.exe -c "import fastapi, uvicorn, pandas, anthropic, MetaTrader5, tvDatafeed, defusedxml, app.main; print('runtime ok')"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          }
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc installer\MT5TVTerminal.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $exe = Get-ChildItem installer\Output\MT5TVTerminal-Setup-*.exe | Select-Object -First 1
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($exe.Name)" | Out-File -Encoding ascii "$($exe.FullName).sha256"
+          "VERSION=$((Get-Content VERSION -Raw).Trim())" >> $env:GITHUB_ENV
+
+      - name: Smoke test - silent install + launch with Windows PowerShell 5.1
+        shell: pwsh
+        env: { MT5TV_NONINTERACTIVE: "1" }
+        run: |
+          $exe = (Get-ChildItem installer\Output\MT5TVTerminal-Setup-*.exe)[0].FullName
+          $dir = Join-Path $env:RUNNER_TEMP 'mt5tv'
+          Start-Process $exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$dir`"", '/MODE=native', '/TASKS=desktopicon' -Wait
+          if (-not (Test-Path "$dir\runtime\python\pythonw.exe")) { throw 'bundled runtime missing after install' }
+          if (-not (Test-Path "$dir\config.json")) { throw 'config.json missing' }
+          Get-Content "$dir\config.json"
+          $launch = Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$dir\launcher\launch.ps1`"", '-NoUpdate' -Wait -PassThru
+          $log = Join-Path $env:LOCALAPPDATA 'MT5TVTerminal'
+          Get-Content "$log\launcher.log" -ErrorAction SilentlyContinue
+          if ($launch.ExitCode -ne 0) { Get-Content "$log\bridge.log" -ErrorAction SilentlyContinue; throw "launcher exited $($launch.ExitCode)" }
+          $health = Invoke-RestMethod http://127.0.0.1:8765/health
+          $health | ConvertTo-Json -Depth 4
+          $ui = Invoke-WebRequest http://127.0.0.1:8765/ -UseBasicParsing
+          if ($ui.Content -notmatch 'id="root"') { throw 'UI page not served' }
+          Write-Host 'Smoke test passed: installer -> launcher -> bridge -> UI'
+          Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$dir\launcher\launch.ps1`"", '-Stop' -Wait
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: installer/Output/*
+
+      - name: Publish release v${{ env.VERSION }}
+        shell: pwsh
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          $tag = "v$env:VERSION"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag exists - replacing assets (bump VERSION to ship an update)"
+            gh release upload $tag installer/Output/* --clobber
+          } else {
+            gh release create $tag installer/Output/* --title "MT5 TV Terminal $env:VERSION" --notes "Windows installer. Install: irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex" --target ${{ github.sha }}
+          }

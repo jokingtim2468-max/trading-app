@@ -1,0 +1,13 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pandas>=2.0
+requests>=2.31
+defusedxml>=0.7
+tzdata>=2024.1; sys_platform == "win32"  # zoneinfo needs it on Windows (FTMO day boundary)
+anthropic>=1.0,<2
+yfinance>=0.2.40
+# MetaTrader5 only ships Windows wheels. On Linux/macOS the bridge runs in SIM mode.
+MetaTrader5>=5.0.45; sys_platform == "win32"
+# TradingView wrapper (maintained fork). Optional: falls back to yfinance when absent.
+tvdatafeed @ https://github.com/rongardF/tvdatafeed/archive/e6f6aaa7de439ac6e454d9b26d2760ded8dc4923.zip  # pinned commit, zip so no git is needed
+rpyc==6.0.2  # Docker mode: talks to MT5 running under Wine (same version inside the mt5 image)
