@@ -94,8 +94,12 @@ function Test-Bridge {
 }
 
 $Config = [pscustomobject]@{ mode = 'native' }
-$cfgPath = Join-Path $AppDir 'config.json'
-if (Test-Path $cfgPath) { try { $Config = Get-Content $cfgPath -Raw | ConvertFrom-Json } catch { Log "bad config.json: $_" } }
+# Per-user override (written when the user switches mode) wins over the installer's choice;
+# it lives in LOCALAPPDATA so it is writable even for an all-users install.
+$cfgPath = Join-Path $DataDir 'config.json'
+foreach ($c in @((Join-Path $AppDir 'config.json'), $cfgPath)) {
+  if (Test-Path $c) { try { $Config = Get-Content $c -Raw | ConvertFrom-Json } catch { Log "bad ${c}: $_" } }
+}
 Log "mode: $($Config.mode)"
 
 try {
@@ -149,20 +153,44 @@ try {
   if ($health) {
     Log 'bridge already running'
   } elseif ($Config.mode -eq 'docker') {
+    $dockerProblem = $null
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-      Fail "Docker mode needs Docker Desktop, which is not installed.`n`nInstall it (https://www.docker.com/products/docker-desktop/) or re-run the installer and choose Native mode."
+      $dockerProblem = 'Docker Desktop is not installed.'
+    } else {
+      Status 'Starting Docker...'
+      if ((Invoke-Hidden 'docker' @('info')) -ne 0) {
+        $dd = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
+        if (Test-Path $dd) { Start-Process $dd -WindowStyle Minimized }
+        $ok = $false
+        for ($i = 0; $i -lt 100; $i++) { Pump 3; if ((Invoke-Hidden 'docker' @('info')) -eq 0) { $ok = $true; break } }
+        if (-not $ok) { $dockerProblem = 'Docker Desktop did not start within 5 minutes (it may still need WSL 2 set up or a restart).' }
+      }
+      if (-not $dockerProblem) {
+        Status 'Starting the MT5 and bridge containers (first start builds them: 5-15 min)...'
+        $code = Invoke-Hidden 'docker' @('compose', 'up', '-d', '--build')
+        if ($code -ne 0) { $dockerProblem = "Starting the containers failed (exit $code)." }
+      }
     }
-    Status 'Starting Docker...'
-    if ((Invoke-Hidden 'docker' @('info')) -ne 0) {
-      $dd = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
-      if (Test-Path $dd) { Start-Process $dd -WindowStyle Minimized }
-      $ok = $false
-      for ($i = 0; $i -lt 60; $i++) { Pump 3; if ((Invoke-Hidden 'docker' @('info')) -eq 0) { $ok = $true; break } }
-      if (-not $ok) { Fail 'Docker Desktop did not start within 3 minutes.' }
+    if ($dockerProblem) {
+      Log "docker mode unavailable: $dockerProblem"
+      $switch = -not $Interactive   # CI / unattended: fall back automatically
+      if ($Interactive) {
+        Close-Splash
+        Add-Type -AssemblyName System.Windows.Forms
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+          "$dockerProblem`n`nSwitch to Native mode instead? It needs no Docker and uses the MetaTrader 5 installed on this PC.`n`n(Yes = switch and start now, No = quit)",
+          'MT5 TV Terminal', 'YesNo', 'Question')
+        $switch = $answer -eq 'Yes'
+      }
+      if (-not $switch) { exit 1 }
+      Set-Content -Path $cfgPath -Value '{"mode": "native"}' -Encoding ASCII
+      $Config = [pscustomobject]@{ mode = 'native' }
+      Log 'switched to native mode'
     }
-    Status 'Starting the MT5 and bridge containers (first start builds them: 5-15 min)...'
-    $code = Invoke-Hidden 'docker' @('compose', 'up', '-d', '--build')
-    if ($code -ne 0) { Fail "Starting the containers failed (exit $code)." }
+  }
+  if ($health) {
+  } elseif ($Config.mode -eq 'docker') {
+    # containers started above
   } else {
     # Native: Python is bundled in the installer under runtime\python with every package.
     $py = Join-Path $AppDir 'runtime\python\pythonw.exe'
